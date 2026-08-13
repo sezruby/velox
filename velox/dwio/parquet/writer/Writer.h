@@ -154,6 +154,10 @@ struct ParquetWriterOptions : public dwio::common::FormatSpecificOptions {
   /// When enabled, per-page statistics are stored in the page index rather than
   /// the data page headers. Defaults to false.
   std::optional<bool> enableWritePageIndex;
+  /// Granularity at which Parquet size statistics (PARQUET-2261) are collected.
+  /// Page-level statistics are only persisted when the page index is also
+  /// written. Defaults to arrow::SizeStatisticsLevel::kNone (off) when unset.
+  std::optional<arrow::SizeStatisticsLevel> sizeStatisticsLevel;
   std::optional<std::string> createdBy;
 
   std::shared_ptr<arrow::MemoryPool> arrowMemoryPool;
