@@ -219,6 +219,25 @@ static constexpr Compression::type DEFAULT_COMPRESSION_TYPE =
     Compression::UNCOMPRESSED;
 static constexpr bool DEFAULT_IS_PAGE_INDEX_ENABLED = false;
 
+/// Granularity at which Parquet SizeStatistics (PARQUET-2261) are collected.
+enum class SizeStatisticsLevel : uint8_t {
+  /// Do not write size statistics.
+  kNone = 0,
+  /// Write size statistics only at the column chunk level, into
+  /// ColumnMetaData.
+  kColumnChunk,
+  /// Write size statistics at both the column chunk level and the page level.
+  /// Page-level statistics are stored in the page index (ColumnIndex and
+  /// OffsetIndex) and are therefore only persisted when the page index is
+  /// written.
+  kPageAndColumnChunk,
+};
+
+// Defaults to off to keep the writer output unchanged unless a caller opts in.
+// Upstream Apache Arrow defaults this to PageAndColumnChunk.
+static constexpr SizeStatisticsLevel DEFAULT_SIZE_STATISTICS_LEVEL =
+    SizeStatisticsLevel::kNone;
+
 class PARQUET_EXPORT ColumnProperties {
  public:
   ColumnProperties(
@@ -327,7 +346,8 @@ class PARQUET_EXPORT WriterProperties {
           createdBy_(
               DEFAULT_CREATED_BY + std::string(" version ") + VELOX_VERSION),
           storeDecimalAsInteger_(false),
-          pageChecksumEnabled_(false) {}
+          pageChecksumEnabled_(false),
+          sizeStatisticsLevel_(DEFAULT_SIZE_STATISTICS_LEVEL) {}
     virtual ~Builder() {}
 
     /// Specify the memory pool for the writer. Default default_memory_pool.
@@ -428,6 +448,13 @@ class PARQUET_EXPORT WriterProperties {
 
     Builder* disablePageChecksum() {
       pageChecksumEnabled_ = false;
+      return this;
+    }
+
+    /// Specify the granularity at which size statistics are collected.
+    /// Default none.
+    Builder* sizeStatisticsLevel(SizeStatisticsLevel level) {
+      sizeStatisticsLevel_ = level;
       return this;
     }
 
@@ -770,7 +797,8 @@ class PARQUET_EXPORT WriterProperties {
           columnProperties,
           dataPageVersion_,
           storeDecimalAsInteger_,
-          std::move(sortingColumns_)));
+          std::move(sortingColumns_),
+          sizeStatisticsLevel_));
     }
 
    private:
@@ -799,6 +827,7 @@ class PARQUET_EXPORT WriterProperties {
     std::unordered_map<std::string, bool> dictionaryEnabled_;
     std::unordered_map<std::string, bool> statisticsEnabled_;
     std::unordered_map<std::string, bool> pageIndexEnabled_;
+    SizeStatisticsLevel sizeStatisticsLevel_;
   };
 
   inline MemoryPool* memoryPool() const {
@@ -919,6 +948,10 @@ class PARQUET_EXPORT WriterProperties {
     return false;
   }
 
+  SizeStatisticsLevel sizeStatisticsLevel() const {
+    return sizeStatisticsLevel_;
+  }
+
   inline FileEncryptionProperties* fileEncryptionProperties() const {
     return fileEncryptionProperties_.get();
   }
@@ -947,7 +980,8 @@ class PARQUET_EXPORT WriterProperties {
       const std::unordered_map<std::string, ColumnProperties>& columnProperties,
       ParquetDataPageVersion dataPageVersion,
       bool storeShortDecimalAsInteger,
-      std::vector<SortingColumn> sortingColumns)
+      std::vector<SortingColumn> sortingColumns,
+      SizeStatisticsLevel sizeStatisticsLevel)
       : pool_(pool),
         dictionaryPagesizeLimit_(dictionaryPagesizeLimit),
         writeBatchSize_(writeBatchSize),
@@ -961,7 +995,8 @@ class PARQUET_EXPORT WriterProperties {
         fileEncryptionProperties_(std::move(fileEncryptionProperties)),
         sortingColumns_(std::move(sortingColumns)),
         defaultColumnProperties_(defaultColumnProperties),
-        columnProperties_(columnProperties) {}
+        columnProperties_(columnProperties),
+        sizeStatisticsLevel_(sizeStatisticsLevel) {}
 
   MemoryPool* pool_;
   int64_t dictionaryPagesizeLimit_;
@@ -980,6 +1015,7 @@ class PARQUET_EXPORT WriterProperties {
 
   ColumnProperties defaultColumnProperties_;
   std::unordered_map<std::string, ColumnProperties> columnProperties_;
+  SizeStatisticsLevel sizeStatisticsLevel_;
 };
 
 PARQUET_EXPORT const std::shared_ptr<WriterProperties>&

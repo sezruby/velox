@@ -24,6 +24,7 @@
 #include "velox/dwio/parquet/writer/arrow/Exception.h"
 #include "velox/dwio/parquet/writer/arrow/Metadata.h"
 #include "velox/dwio/parquet/writer/arrow/Schema.h"
+#include "velox/dwio/parquet/writer/arrow/SizeStatistics.h"
 #include "velox/dwio/parquet/writer/arrow/Statistics.h"
 #include "velox/dwio/parquet/writer/arrow/ThriftInternal.h"
 #include "velox/dwio/parquet/writer/arrow/util/OverflowUtilInternal.h"
@@ -178,6 +179,24 @@ class TypedColumnIndexImpl : public TypedColumnIndex<DType> {
     return nonNullPageIndices_;
   }
 
+  bool hasRepetitionLevelHistograms() const override {
+    return columnIndex_.repetition_level_histograms().has_value();
+  }
+
+  const std::vector<int64_t>& repetitionLevelHistograms() const override {
+    return apache::thrift::can_throw(
+        *columnIndex_.repetition_level_histograms());
+  }
+
+  bool hasDefinitionLevelHistograms() const override {
+    return columnIndex_.definition_level_histograms().has_value();
+  }
+
+  const std::vector<int64_t>& definitionLevelHistograms() const override {
+    return apache::thrift::can_throw(
+        *columnIndex_.definition_level_histograms());
+  }
+
   const std::vector<T>& minValues() const override {
     return minValues_;
   }
@@ -208,14 +227,31 @@ class OffsetIndexImpl : public OffsetIndex {
               *page_location.compressed_page_size(),
               *page_location.first_row_index()});
     }
+    if (offset_index.unencoded_byte_array_data_bytes().has_value()) {
+      hasUnencodedByteArrayDataBytes_ = true;
+      unencodedByteArrayDataBytes_ = apache::thrift::can_throw(
+          *offset_index.unencoded_byte_array_data_bytes());
+    }
   }
 
   const std::vector<PageLocation>& pageLocations() const override {
     return pageLocations_;
   }
 
+  bool hasUnencodedByteArrayDataBytes() const override {
+    return hasUnencodedByteArrayDataBytes_;
+  }
+
+  const std::vector<int64_t>& unencodedByteArrayDataBytes() const override {
+    return unencodedByteArrayDataBytes_;
+  }
+
  private:
   std::vector<PageLocation> pageLocations_;
+  // Unencoded byte array data bytes of each page, only set for BYTE_ARRAY
+  // columns whose pages all reported the value.
+  bool hasUnencodedByteArrayDataBytes_ = false;
+  std::vector<int64_t> unencodedByteArrayDataBytes_;
 };
 
 class RowGroupPageIndexReaderImpl : public RowGroupPageIndexReader {
@@ -498,6 +534,24 @@ enum class BuilderState {
   kDiscarded
 };
 
+// Append a page's level histogram to the concatenated column-index histogram.
+// A page that provides an empty histogram invalidates the field, matching how
+// a missing null count invalidates the null-count list.
+template <typename HistogramFieldRef>
+void appendLevelHistogram(
+    HistogramFieldRef histogramField,
+    const std::vector<int64_t>& pageHistogram) {
+  if (!histogramField.has_value()) {
+    return;
+  }
+  if (pageHistogram.empty()) {
+    histogramField.reset();
+    return;
+  }
+  histogramField->insert(
+      histogramField->end(), pageHistogram.cbegin(), pageHistogram.cend());
+}
+
 template <typename DType>
 class ColumnIndexBuilderImpl final : public ColumnIndexBuilder {
  public:
@@ -509,11 +563,16 @@ class ColumnIndexBuilderImpl final : public ColumnIndexBuilder {
     /// from any page will invalidate the nullCounts vector of the column
     /// index.
     columnIndex_.null_counts() = {};
+    /// Initialize the level histograms as set. A page that lacks a histogram
+    /// invalidates the corresponding histogram of the whole column index.
+    columnIndex_.repetition_level_histograms() = {};
+    columnIndex_.definition_level_histograms() = {};
     columnIndex_.boundary_order() =
         facebook::velox::parquet::thrift::BoundaryOrder::UNORDERED;
   }
 
-  void addPage(const EncodedStatistics& stats) override {
+  void addPage(const EncodedStatistics& stats, const SizeStatistics& sizeStats)
+      override {
     if (state_ == BuilderState::kFinished) {
       throw ParquetException("Cannot add page to finished ColumnIndexBuilder.");
     } else if (state_ == BuilderState::kDiscarded) {
@@ -545,6 +604,15 @@ class ColumnIndexBuilderImpl final : public ColumnIndexBuilder {
     } else {
       columnIndex_.null_counts().reset();
     }
+
+    /// Concatenate the level histograms of this page. A page without a
+    /// histogram invalidates the histogram of the whole column index.
+    appendLevelHistogram(
+        columnIndex_.repetition_level_histograms(),
+        sizeStats.repetitionLevelHistogram);
+    appendLevelHistogram(
+        columnIndex_.definition_level_histograms(),
+        sizeStats.definitionLevelHistogram);
   }
 
   void finish() override {
@@ -658,12 +726,17 @@ class ColumnIndexBuilderImpl final : public ColumnIndexBuilder {
 
 class OffsetIndexBuilderImpl final : public OffsetIndexBuilder {
  public:
-  OffsetIndexBuilderImpl() = default;
+  OffsetIndexBuilderImpl() {
+    /// Initialize the unencoded byte array data bytes as set. A page that
+    /// lacks it invalidates the field of the whole offset index.
+    offsetIndex_.unencoded_byte_array_data_bytes() = {};
+  }
 
   void addPage(
       int64_t offset,
       int32_t compressedPageSize,
-      int64_t firstRowIndex) override {
+      int64_t firstRowIndex,
+      std::optional<int64_t> unencodedByteArrayDataBytes) override {
     if (state_ == BuilderState::kFinished) {
       throw ParquetException("Cannot add page to finished OffsetIndexBuilder.");
     } else if (state_ == BuilderState::kDiscarded) {
@@ -678,6 +751,14 @@ class OffsetIndexBuilderImpl final : public OffsetIndexBuilder {
     page_location.compressed_page_size() = compressedPageSize;
     page_location.first_row_index() = firstRowIndex;
     offsetIndex_.page_locations()->emplace_back(std::move(page_location));
+
+    if (offsetIndex_.unencoded_byte_array_data_bytes().has_value() &&
+        unencodedByteArrayDataBytes.has_value()) {
+      offsetIndex_.unencoded_byte_array_data_bytes()->emplace_back(
+          *unencodedByteArrayDataBytes);
+    } else {
+      offsetIndex_.unencoded_byte_array_data_bytes().reset();
+    }
   }
 
   void finish(int64_t finalPosition) override {

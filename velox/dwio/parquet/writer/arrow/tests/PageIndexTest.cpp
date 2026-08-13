@@ -20,6 +20,7 @@
 
 #include <gtest/gtest.h>
 
+#include "velox/dwio/parquet/writer/arrow/SizeStatistics.h"
 #include "velox/dwio/parquet/writer/arrow/ThriftInternal.h"
 #include "velox/dwio/parquet/writer/arrow/tests/TestUtil.h"
 
@@ -255,7 +256,8 @@ TEST(PageIndex, WriteOffsetIndex) {
   const std::vector<int32_t> pageSizes = {1024, 2048, 3072, 4096, 8192};
   const std::vector<int64_t> firstRowIndices = {0, 10000, 20000, 30000, 40000};
   for (size_t i = 0; i < numPages; ++i) {
-    Builder->addPage(offsets[i], pageSizes[i], firstRowIndices[i]);
+    Builder->addPage(
+        offsets[i], pageSizes[i], firstRowIndices[i], std::nullopt);
   }
   const int64_t finalPosition = 4096;
   Builder->finish(finalPosition);
@@ -295,7 +297,7 @@ void testWriteTypedColumnIndex(
 
   auto Builder = ColumnIndexBuilder::make(descr.get());
   for (const auto& stats : pageStats) {
-    Builder->addPage(stats);
+    Builder->addPage(stats, SizeStatistics());
   }
   ASSERT_NO_THROW(Builder->finish());
 
@@ -459,7 +461,7 @@ TEST(PageIndex, WriteColumnIndexWithCorruptedStats) {
   ColumnDescriptor descr(schema::int32("c1"), 1, 0);
   auto Builder = ColumnIndexBuilder::make(&descr);
   for (const auto& stats : pageStats) {
-    Builder->addPage(stats);
+    Builder->addPage(stats, SizeStatistics());
   }
   ASSERT_NO_THROW(Builder->finish());
   ASSERT_EQ(nullptr, Builder->build());
@@ -511,8 +513,8 @@ class PageIndexBuilderTest : public ::testing::Test {
       for (int column = 0; column < numColumns; ++column) {
         if (static_cast<size_t>(column) < pageStats[rowGroup].size()) {
           auto ColumnIndexBuilder = Builder->getColumnIndexBuilder(column);
-          ASSERT_NO_THROW(
-              ColumnIndexBuilder->addPage(pageStats[rowGroup][column]));
+          ASSERT_NO_THROW(ColumnIndexBuilder->addPage(
+              pageStats[rowGroup][column], SizeStatistics()));
           ASSERT_NO_THROW(ColumnIndexBuilder->finish());
         }
 

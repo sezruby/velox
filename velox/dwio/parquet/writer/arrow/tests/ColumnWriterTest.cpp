@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include "arrow/io/buffered.h"
@@ -31,6 +32,7 @@
 #include "velox/dwio/parquet/writer/arrow/Metadata.h"
 #include "velox/dwio/parquet/writer/arrow/Platform.h"
 #include "velox/dwio/parquet/writer/arrow/Properties.h"
+#include "velox/dwio/parquet/writer/arrow/SizeStatistics.h"
 #include "velox/dwio/parquet/writer/arrow/Statistics.h"
 #include "velox/dwio/parquet/writer/arrow/ThriftInternal.h"
 #include "velox/dwio/parquet/writer/arrow/Types.h"
@@ -956,6 +958,117 @@ TEST(TestColumnWriter, RepeatedListsUpdateSpacedBug) {
   typedWriter->writeBatchSpaced(
       14, defLevels.data(), repLevels.data(), validBits->data(), 0, valuesData);
   writer->close();
+}
+
+TEST(TestColumnWriter, ByteArrayWriteBatchSizeStatistics) {
+  // The low-level writeBatch API bypasses the Arrow write path, so it counts
+  // unencoded BYTE_ARRAY bytes itself. A required column reaches writeValues.
+  SchemaDescriptor schema;
+  schema.init(schema::GroupNode::make(
+      "schema",
+      Repetition::kRequired,
+      {schema::PrimitiveNode::make(
+          "c0", Repetition::kRequired, Type::kByteArray)}));
+
+  auto sink = createOutputStream();
+  auto props = WriterProperties::Builder()
+                   .sizeStatisticsLevel(SizeStatisticsLevel::kColumnChunk)
+                   ->build();
+  auto metadata = ColumnChunkMetaDataBuilder::make(props, schema.column(0));
+  std::unique_ptr<PageWriter> pager = PageWriter::open(
+      sink,
+      Compression::UNCOMPRESSED,
+      Codec::useDefaultCompressionLevel(),
+      metadata.get());
+  auto writer = std::static_pointer_cast<TypedColumnWriter<ByteArrayType>>(
+      ColumnWriter::make(metadata.get(), std::move(pager), props.get()));
+
+  const std::vector<std::string> strings = {
+      "alpha", "beta", "gamma", "delta", "epsilon"};
+  std::vector<ByteArray> values;
+  values.reserve(strings.size());
+  int64_t expectedBytes{0};
+  for (const auto& value : strings) {
+    values.emplace_back(value);
+    expectedBytes += value.size();
+  }
+  writer->writeBatch(
+      static_cast<int64_t>(values.size()), nullptr, nullptr, values.data());
+  writer->close();
+
+  auto accessor =
+      ColumnChunkMetaData::make(metadata->Contents(), schema.column(0));
+  ASSERT_TRUE(accessor->isSizeStatsSet());
+  auto stats = accessor->sizeStatistics();
+  ASSERT_NE(stats, nullptr);
+  ASSERT_TRUE(stats->unencodedByteArrayDataBytes.has_value());
+  EXPECT_EQ(stats->unencodedByteArrayDataBytes.value(), expectedBytes);
+  // A required column has neither definition nor repetition levels.
+  EXPECT_TRUE(stats->definitionLevelHistogram.empty());
+  EXPECT_TRUE(stats->repetitionLevelHistogram.empty());
+}
+
+TEST(TestColumnWriter, ByteArrayWriteBatchSpacedSizeStatistics) {
+  // writeBatchSpaced reaches writeValuesSpaced, which counts unencoded bytes
+  // for the valid slots only. An optional column carries a definition
+  // histogram indexed by definition level.
+  SchemaDescriptor schema;
+  schema.init(schema::GroupNode::make(
+      "schema",
+      Repetition::kRequired,
+      {schema::PrimitiveNode::make(
+          "c0", Repetition::kOptional, Type::kByteArray)}));
+
+  auto sink = createOutputStream();
+  auto props = WriterProperties::Builder()
+                   .sizeStatisticsLevel(SizeStatisticsLevel::kColumnChunk)
+                   ->build();
+  auto metadata = ColumnChunkMetaDataBuilder::make(props, schema.column(0));
+  std::unique_ptr<PageWriter> pager = PageWriter::open(
+      sink,
+      Compression::UNCOMPRESSED,
+      Codec::useDefaultCompressionLevel(),
+      metadata.get());
+  auto writer = std::static_pointer_cast<TypedColumnWriter<ByteArrayType>>(
+      ColumnWriter::make(metadata.get(), std::move(pager), props.get()));
+
+  // Six slots with nulls at indices 1 and 4; the spaced values buffer keeps a
+  // slot for every level, and the null slots are skipped via the validity map.
+  const std::vector<std::string> strings = {
+      "alpha", "", "gamma", "delta", "", "zeta"};
+  const std::vector<int16_t> defLevels = {1, 0, 1, 1, 0, 1};
+  std::vector<ByteArray> values;
+  values.reserve(strings.size());
+  int64_t expectedBytes{0};
+  for (size_t i = 0; i < strings.size(); ++i) {
+    values.emplace_back(strings[i]);
+    if (defLevels[i] == 1) {
+      expectedBytes += strings[i].size();
+    }
+  }
+  std::shared_ptr<Buffer> validBits;
+  ASSERT_OK_AND_ASSIGN(
+      validBits, ::arrow::internal::BytesToBits({1, 0, 1, 1, 0, 1}));
+  writer->writeBatchSpaced(
+      static_cast<int64_t>(strings.size()),
+      defLevels.data(),
+      /*repLevels=*/nullptr,
+      validBits->data(),
+      /*validBitsOffset=*/0,
+      values.data());
+  writer->close();
+
+  auto accessor =
+      ColumnChunkMetaData::make(metadata->Contents(), schema.column(0));
+  ASSERT_TRUE(accessor->isSizeStatsSet());
+  auto stats = accessor->sizeStatistics();
+  ASSERT_NE(stats, nullptr);
+  ASSERT_TRUE(stats->unencodedByteArrayDataBytes.has_value());
+  EXPECT_EQ(stats->unencodedByteArrayDataBytes.value(), expectedBytes);
+  // Optional, non-repeated: the definition histogram is [numNull, numNonNull]
+  // and there is no repetition histogram.
+  EXPECT_THAT(stats->definitionLevelHistogram, testing::ElementsAre(2, 4));
+  EXPECT_TRUE(stats->repetitionLevelHistogram.empty());
 }
 
 void generateLevels(

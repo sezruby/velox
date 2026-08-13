@@ -28,6 +28,7 @@
 #include <optional>
 #include <string>
 
+#include "velox/dwio/parquet/writer/arrow/SizeStatistics.h"
 #include "velox/dwio/parquet/writer/arrow/Statistics.h"
 #include "velox/dwio/parquet/writer/arrow/Types.h"
 
@@ -89,6 +90,11 @@ class DataPage : public Page {
   std::optional<int64_t> firstRowIndex() const {
     return firstRowIndex_;
   }
+  /// Return the size statistics of this data page. Empty when size statistics
+  /// are not collected.
+  const SizeStatistics& sizeStatistics() const {
+    return sizeStatistics_;
+  }
 
   virtual ~DataPage() = default;
 
@@ -100,13 +106,15 @@ class DataPage : public Page {
       Encoding::type encoding,
       int64_t uncompressedSize,
       const EncodedStatistics& statistics = EncodedStatistics(),
-      std::optional<int64_t> firstRowIndex = std::nullopt)
+      std::optional<int64_t> firstRowIndex = std::nullopt,
+      SizeStatistics sizeStatistics = SizeStatistics())
       : Page(buffer, type),
         numValues_(numValues),
         encoding_(encoding),
         uncompressedSize_(uncompressedSize),
         statistics_(statistics),
-        firstRowIndex_(std::move(firstRowIndex)) {}
+        firstRowIndex_(std::move(firstRowIndex)),
+        sizeStatistics_(std::move(sizeStatistics)) {}
 
   int32_t numValues_;
   Encoding::type encoding_;
@@ -114,6 +122,8 @@ class DataPage : public Page {
   EncodedStatistics statistics_;
   /// Row ordinal within the row group to the first row in the data page.
   std::optional<int64_t> firstRowIndex_;
+  /// Size statistics for the data page.
+  SizeStatistics sizeStatistics_;
 };
 
 class DataPageV1 : public DataPage {
@@ -126,7 +136,8 @@ class DataPageV1 : public DataPage {
       Encoding::type repetitionLevelEncoding,
       int64_t uncompressedSize,
       const EncodedStatistics& statistics = EncodedStatistics(),
-      std::optional<int64_t> firstRowIndex = std::nullopt)
+      std::optional<int64_t> firstRowIndex = std::nullopt,
+      SizeStatistics sizeStatistics = SizeStatistics())
       : DataPage(
             PageType::kDataPage,
             buffer,
@@ -134,7 +145,8 @@ class DataPageV1 : public DataPage {
             encoding,
             uncompressedSize,
             statistics,
-            std::move(firstRowIndex)),
+            std::move(firstRowIndex),
+            std::move(sizeStatistics)),
         definitionLevelEncoding_(definitionLevelEncoding),
         repetitionLevelEncoding_(repetitionLevelEncoding) {}
 
@@ -164,7 +176,8 @@ class DataPageV2 : public DataPage {
       int64_t uncompressedSize,
       bool isCompressed = false,
       const EncodedStatistics& statistics = EncodedStatistics(),
-      std::optional<int64_t> firstRowIndex = std::nullopt)
+      std::optional<int64_t> firstRowIndex = std::nullopt,
+      SizeStatistics sizeStatistics = SizeStatistics())
       : DataPage(
             PageType::kDataPageV2,
             buffer,
@@ -172,7 +185,8 @@ class DataPageV2 : public DataPage {
             encoding,
             uncompressedSize,
             statistics,
-            std::move(firstRowIndex)),
+            std::move(firstRowIndex),
+            std::move(sizeStatistics)),
         numNulls_(numNulls),
         numRows_(numRows),
         definitionLevelsByteLength_(definitionLevelsByteLength),

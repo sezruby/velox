@@ -244,6 +244,52 @@ struct Statistics {
   6: optional binary min_value;
 }
 
+/**
+ * A structure for capturing metadata for estimating the unencoded,
+ * uncompressed size of data written. This is useful for readers to estimate
+ * how much memory is needed to reconstruct data in their memory model and for
+ * fine grained filter pushdown on nested structures (the histograms contained
+ * in this structure can help determine the number of nulls at a particular
+ * nesting level and maximum length of lists).
+ */
+struct SizeStatistics {
+  /**
+   * The number of physical bytes stored for BYTE_ARRAY data values assuming
+   * no encoding. This is exclusive of the bytes needed to store the length of
+   * each byte array. In other words, this field is equivalent to the `(size
+   * of PLAIN-ENCODING the byte array values) - (4 bytes * number of values
+   * written)`. To determine unencoded sizes of other types readers can use
+   * schema information multiplied by the number of non-null and null values.
+   * The number of null/non-null values can be inferred from the histograms
+   * below.
+   *
+   * For example, if a column chunk is dictionary-encoded with dictionary
+   * ["a", "bc", "cde"], and a data page contains the indices [0, 0, 1, 2],
+   * then this value for that data page should be 7 (1 + 1 + 2 + 3).
+   *
+   * This field should only be set for types that use BYTE_ARRAY as their
+   * physical type.
+   */
+  1: optional i64 unencoded_byte_array_data_bytes;
+  /**
+   * When present, there is expected to be one element corresponding to each
+   * repetition (i.e. size=max repetition_level+1) where each element
+   * represents the number of times the repetition level was observed in the
+   * data.
+   *
+   * This field may be omitted if max_repetition_level is 0 without loss of
+   * information.
+   */
+  2: optional list<i64> repetition_level_histogram;
+  /**
+   * Same as repetition_level_histogram except for definition levels.
+   *
+   * This field may be omitted if max_definition_level is 0 or 1 without loss
+   * of information.
+   */
+  3: optional list<i64> definition_level_histogram;
+}
+
 /** Empty structs to use as logical type annotations */
 struct StringType {} // allowed for BINARY, must be encoded with UTF-8
 struct UUIDType {} // allowed for FIXED[16], must encoded raw UUID bytes
@@ -767,6 +813,19 @@ struct ColumnMetaData {
 
   /** Byte offset from beginning of file to Bloom filter data. **/
   14: optional i64 bloom_filter_offset;
+
+  /**
+   * Optional statistics to help estimate total memory when converted to
+   * in-memory representations. The histograms contained in these statistics
+   * can also be useful in some cases for more fine-grained nullability/list
+   * length filter pushdown.
+   *
+   * Field id 16 matches the parquet-format spec (field 15 is the spec's
+   * bloom_filter_length, which this schema does not define). The field id is
+   * serialized on the wire, so it must match the spec for cross-reader
+   * interoperability.
+   */
+  16: optional SizeStatistics size_statistics;
 }
 
 struct EncryptionWithFooterKey {}
@@ -932,6 +991,14 @@ struct OffsetIndex {
    * that page_locations[i].first_row_index < page_locations[i+1].first_row_index.
    */
   1: list<PageLocation> page_locations;
+  /**
+   * Unencoded/uncompressed size of the data page for BYTE_ARRAY types, as
+   * defined in SizeStatistics.unencoded_byte_array_data_bytes. This field
+   * should only be set for types that use BYTE_ARRAY as their physical type
+   * and has one element for each page in the OffsetIndex, ordered the same as
+   * page_locations.
+   */
+  2: optional list<i64> unencoded_byte_array_data_bytes;
 }
 
 /**
@@ -970,6 +1037,24 @@ struct ColumnIndex {
 
   /** A list containing the number of null values for each page **/
   5: optional list<i64> null_counts;
+
+  /**
+   * Contains repetition level histograms for each page concatenated together.
+   * The repetition_level_histogram field on SizeStatistics contains more
+   * details.
+   *
+   * When present the length should always be (number of pages *
+   * (max_repetition_level + 1)) elements.
+   *
+   * Element 0 is the first element of the histogram for the first page.
+   * Element (max_repetition_level + 1) is the first element of the histogram
+   * for the second page.
+   */
+  6: optional list<i64> repetition_level_histograms;
+  /**
+   * Same as repetition_level_histograms except for definitions levels.
+   */
+  7: optional list<i64> definition_level_histograms;
 }
 
 struct AesGcmV1 {

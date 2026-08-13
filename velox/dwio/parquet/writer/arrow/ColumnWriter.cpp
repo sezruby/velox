@@ -481,7 +481,7 @@ class SerializedPageWriter : public PageWriter {
 
     /// Collect page index.
     if (columnIndexBuilder_ != nullptr) {
-      columnIndexBuilder_->addPage(page.statistics());
+      columnIndexBuilder_->addPage(page.statistics(), page.sizeStatistics());
     }
     if (offsetIndexBuilder_ != nullptr) {
       const int64_t compressedSize = outputDataLen + headerSize;
@@ -497,7 +497,8 @@ class SerializedPageWriter : public PageWriter {
       offsetIndexBuilder_->addPage(
           startPos,
           static_cast<int32_t>(compressedSize),
-          *page.firstRowIndex());
+          *page.firstRowIndex(),
+          page.sizeStatistics().unencodedByteArrayDataBytes);
     }
 
     totalUncompressedSize_ += uncompressedSize + headerSize;
@@ -945,6 +946,14 @@ class ColumnWriterImpl {
   // Merges page statistics into chunk statistics, then resets the values.
   virtual void resetPageStatistics() = 0;
 
+  // Size statistics of the current page. Empty when size statistics are not
+  // collected or when only chunk-level statistics are requested.
+  virtual SizeStatistics getPageSizeStatistics() = 0;
+
+  // Size statistics of the whole chunk. Empty when size statistics are not
+  // collected.
+  virtual SizeStatistics getChunkSizeStatistics() = 0;
+
   // Adds Data Pages to an in memory buffer in dictionary encoding mode.
   // Serializes the Data Pages in other encoding modes.
   void addDataPage();
@@ -1177,6 +1186,7 @@ void ColumnWriterImpl::buildDataPageV1(
   EncodedStatistics pageStats = getPageStatistics();
   pageStats.applyStatSizeLimits(properties_->maxStatisticsSize(descr_->path()));
   pageStats.setIsSigned(SortOrder::kSigned == descr_->sortOrder());
+  SizeStatistics pageSizeStats = getPageSizeStatistics();
   resetPageStatistics();
 
   std::shared_ptr<Buffer> compressedData;
@@ -1205,7 +1215,8 @@ void ColumnWriterImpl::buildDataPageV1(
         Encoding::kRle,
         uncompressedSize,
         pageStats,
-        firstRowIndex);
+        firstRowIndex,
+        std::move(pageSizeStats));
     totalCompressedBytes_ +=
         pagePtr->size() + sizeof(facebook::velox::parquet::thrift::PageHeader);
 
@@ -1219,7 +1230,8 @@ void ColumnWriterImpl::buildDataPageV1(
         Encoding::kRle,
         uncompressedSize,
         pageStats,
-        firstRowIndex);
+        firstRowIndex,
+        std::move(pageSizeStats));
     writeDataPage(page);
   }
 }
@@ -1254,6 +1266,7 @@ void ColumnWriterImpl::buildDataPageV2(
   EncodedStatistics pageStats = getPageStatistics();
   pageStats.applyStatSizeLimits(properties_->maxStatisticsSize(descr_->path()));
   pageStats.setIsSigned(SortOrder::kSigned == descr_->sortOrder());
+  SizeStatistics pageSizeStats = getPageSizeStatistics();
   resetPageStatistics();
 
   int32_t numValues = static_cast<int32_t>(numBufferedValues_);
@@ -1284,7 +1297,8 @@ void ColumnWriterImpl::buildDataPageV2(
         uncompressedSize,
         pager_->hasCompressor(),
         pageStats,
-        firstRowIndex);
+        firstRowIndex,
+        std::move(pageSizeStats));
     totalCompressedBytes_ +=
         pagePtr->size() + sizeof(facebook::velox::parquet::thrift::PageHeader);
     dataPages_.push_back(std::move(pagePtr));
@@ -1300,7 +1314,8 @@ void ColumnWriterImpl::buildDataPageV2(
         uncompressedSize,
         pager_->hasCompressor(),
         pageStats,
-        firstRowIndex);
+        firstRowIndex,
+        std::move(pageSizeStats));
     writeDataPage(page);
   }
 }
@@ -1322,6 +1337,15 @@ int64_t ColumnWriterImpl::close() {
     // Write stats only if the column has at least one row written.
     if (rowsWritten_ > 0 && chunkStatistics.isSet()) {
       metadata_->setStatistics(chunkStatistics);
+    }
+
+    // Write chunk-level size statistics when they were collected.
+    SizeStatistics chunkSizeStatistics = getChunkSizeStatistics();
+    if (rowsWritten_ > 0 && chunkSizeStatistics.isSet()) {
+      // The statistics are well-formed by construction; validating here guards
+      // against a future regression before they reach the file metadata.
+      chunkSizeStatistics.validate(descr_);
+      metadata_->setSizeStatistics(chunkSizeStatistics);
     }
     pager_->close(hasDictionary_, fallback_);
   }
@@ -1478,6 +1502,10 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
         (SortOrder::kUnknown != descr_->sortOrder())) {
       pageStatistics_ = makeStatistics<DType>(descr_, allocator_);
       chunkStatistics_ = makeStatistics<DType>(descr_, allocator_);
+    }
+    if (properties->sizeStatisticsLevel() != SizeStatisticsLevel::kNone) {
+      pageSizeStatistics_ = SizeStatistics::make(descr_);
+      chunkSizeStatistics_ = SizeStatistics::make(descr_);
     }
     pagesChangeOnRecordBoundaries_ =
         properties->dataPageVersion() == ParquetDataPageVersion::V2 ||
@@ -1699,6 +1727,30 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
       chunkStatistics_->merge(*pageStatistics_);
       pageStatistics_->reset();
     }
+    if (chunkSizeStatistics_ != nullptr) {
+      chunkSizeStatistics_->merge(*pageSizeStatistics_);
+      pageSizeStatistics_->reset();
+    }
+  }
+
+  SizeStatistics getPageSizeStatistics() override {
+    // Page-level size statistics are only emitted at the finest level. When
+    // the level is column-chunk only, the accumulated per-page values still
+    // feed the chunk total via resetPageStatistics() but are not attached to
+    // the page.
+    if (pageSizeStatistics_ == nullptr ||
+        properties_->sizeStatisticsLevel() !=
+            SizeStatisticsLevel::kPageAndColumnChunk) {
+      return SizeStatistics();
+    }
+    return *pageSizeStatistics_;
+  }
+
+  SizeStatistics getChunkSizeStatistics() override {
+    if (chunkSizeStatistics_ == nullptr) {
+      return SizeStatistics();
+    }
+    return *chunkSizeStatistics_;
   }
 
   Type::type type() const override {
@@ -1745,6 +1797,10 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
   DictEncoder<DType>* currentDictEncoder_;
   std::shared_ptr<TypedStats> pageStatistics_;
   std::shared_ptr<TypedStats> chunkStatistics_;
+  // Size statistics accumulated for the current page and the whole chunk. Null
+  // when size statistics collection is disabled.
+  std::unique_ptr<SizeStatistics> pageSizeStatistics_;
+  std::unique_ptr<SizeStatistics> chunkSizeStatistics_;
   bool pagesChangeOnRecordBoundaries_;
 
   // If writing a sequence of ::arrow::DictionaryArray to the writer, we keep
@@ -1768,6 +1824,12 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
       }
 
       writeDefinitionLevels(numValues, defLevels);
+      if (pageSizeStatistics_ != nullptr) {
+        updateLevelHistogram(
+            defLevels,
+            numValues,
+            pageSizeStatistics_->definitionLevelHistogram);
+      }
     } else {
       // Required field, write all values.
       valuesToWrite = numValues;
@@ -1785,6 +1847,12 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
       }
 
       writeRepetitionLevels(numValues, repLevels);
+      if (pageSizeStatistics_ != nullptr) {
+        updateLevelHistogram(
+            repLevels,
+            numValues,
+            pageSizeStatistics_->repetitionLevelHistogram);
+      }
     } else {
       // Each value is exactly one row.
       rowsWritten_ += numValues;
@@ -1870,6 +1938,12 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
     // levels.
     if (descr_->maxDefinitionLevel() > 0) {
       writeDefinitionLevels(numLevels, defLevels);
+      if (pageSizeStatistics_ != nullptr) {
+        updateLevelHistogram(
+            defLevels,
+            numLevels,
+            pageSizeStatistics_->definitionLevelHistogram);
+      }
     }
     // Not present for non-repeated fields.
     if (descr_->maxRepetitionLevel() > 0) {
@@ -1882,6 +1956,12 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
         }
       }
       writeRepetitionLevels(numLevels, repLevels);
+      if (pageSizeStatistics_ != nullptr) {
+        updateLevelHistogram(
+            repLevels,
+            numLevels,
+            pageSizeStatistics_->repetitionLevelHistogram);
+      }
     } else {
       // Each value is exactly one row.
       rowsWritten_ += numLevels;
@@ -1949,6 +2029,18 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
     if (pageStatistics_ != nullptr) {
       pageStatistics_->update(values, numValues, numNulls);
     }
+    if constexpr (std::is_same_v<DType, ByteArrayType>) {
+      // The Arrow write path counts BYTE_ARRAY bytes at the array level, so
+      // this only runs for the low-level writeBatch API. 'values' holds the
+      // non-null values densely, so their lengths sum to the unencoded bytes.
+      if (pageSizeStatistics_ != nullptr) {
+        int64_t numBytes{0};
+        for (int64_t i = 0; i < numValues; ++i) {
+          numBytes += values[i].len;
+        }
+        pageSizeStatistics_->incrementUnencodedByteArrayDataBytes(numBytes);
+      }
+    }
   }
 
   /// \brief Write values with spaces and update page statistics accordingly.
@@ -1990,8 +2082,58 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
           numValues,
           numNulls);
     }
+    if constexpr (std::is_same_v<DType, ByteArrayType>) {
+      // As in writeValues(), count unencoded BYTE_ARRAY bytes for the low-level
+      // writeBatch API. Null slots in the spaced buffer carry no value, so they
+      // are skipped via the validity bitmap.
+      if (pageSizeStatistics_ != nullptr) {
+        int64_t numBytes{0};
+        for (int64_t i = 0; i < numSpacedValues; ++i) {
+          if (numValues == numSpacedValues ||
+              ::arrow::bit_util::GetBit(validBits, validBitsOffset + i)) {
+            numBytes += values[i].len;
+          }
+        }
+        pageSizeStatistics_->incrementUnencodedByteArrayDataBytes(numBytes);
+      }
+    }
   }
 };
+
+namespace {
+
+// Sums the value byte lengths across the non-null entries of a base-binary
+// array. Null slots carry no value bytes, so with no nulls the whole-array
+// offset span is exact and the per-value loop is skipped.
+template <typename ArrayType>
+int64_t sumBinaryValueBytes(const ArrayType& array) {
+  if (array.null_count() == 0) {
+    return array.value_offset(array.length()) - array.value_offset(0);
+  }
+  int64_t totalBytes = 0;
+  for (int64_t i = 0; i < array.length(); ++i) {
+    if (array.IsValid(i)) {
+      totalBytes += array.value_length(i);
+    }
+  }
+  return totalBytes;
+}
+
+// Returns the unencoded BYTE_ARRAY byte count of 'array' as defined by
+// PARQUET-2261: the total value bytes of the non-null entries, excluding the
+// four-byte length prefix each value would carry on the wire. 'array' must be
+// base-binary-like (BINARY/STRING or their large variants).
+int64_t byteArrayDataBytes(const ::arrow::Array& array) {
+  if (::arrow::is_binary_like(array.type_id())) {
+    return sumBinaryValueBytes(
+        checked_cast<const ::arrow::BinaryArray&>(array));
+  }
+  VELOX_DCHECK(::arrow::is_large_binary_like(array.type_id()));
+  return sumBinaryValueBytes(
+      checked_cast<const ::arrow::LargeBinaryArray&>(array));
+}
+
+} // namespace
 
 template <typename DType>
 Status TypedColumnWriterImpl<DType>::writeArrowDictionary(
@@ -2106,6 +2248,21 @@ Status TypedColumnWriterImpl<DType>::writeArrowDictionary(
             writeableIndices,
             maybeReplaceValidity(writeableIndices, nullCount, ctx->memoryPool));
         dictEncoder->putIndices(*writeableIndices);
+        if (pageSizeStatistics_ != nullptr &&
+            descr_->physicalType() == Type::kByteArray) {
+          // The index path never materializes the referenced values, so decode
+          // this chunk to dense to count their unencoded bytes. Build the
+          // dictionary array from the validity-adjusted indices so values under
+          // ancestor nulls, which are not written, are excluded just as the
+          // dense path excludes them.
+          auto adjustedDictionary = std::make_shared<::arrow::DictionaryArray>(
+              data.type(), writeableIndices, dictionary);
+          std::shared_ptr<Array> denseValues;
+          PARQUET_THROW_NOT_OK(convertDictionaryToDense(
+              *adjustedDictionary, ctx->memoryPool, &denseValues));
+          pageSizeStatistics_->incrementUnencodedByteArrayDataBytes(
+              byteArrayDataBytes(*denseValues));
+        }
         commitWriteAndCheckPageLimit(
             batchSize, batchNumValues, nullCount, checkPage);
         valueOffset += batchNumSpacedValues;
@@ -2691,6 +2848,13 @@ Status TypedColumnWriterImpl<ByteArrayType>::writeArrowDense(
       pageStatistics_->update(*dataSlice, false);
       pageStatistics_->incrementNullCount(batchSize - nonNull);
       pageStatistics_->incrementNumValues(nonNull);
+    }
+    if (pageSizeStatistics_ != nullptr) {
+      // The dense BYTE_ARRAY path writes values straight through the encoder,
+      // so the unencoded byte count is accumulated from the array here rather
+      // than in writeValues().
+      pageSizeStatistics_->incrementUnencodedByteArrayDataBytes(
+          byteArrayDataBytes(*dataSlice));
     }
     commitWriteAndCheckPageLimit(
         batchSize, batchNumValues, batchSize - nonNull, checkPage);
