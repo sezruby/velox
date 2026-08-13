@@ -37,6 +37,7 @@
 #include "velox/dwio/parquet/writer/arrow/FileDecryptorInternal.h"
 #include "velox/dwio/parquet/writer/arrow/Schema.h"
 #include "velox/dwio/parquet/writer/arrow/SchemaInternal.h"
+#include "velox/dwio/parquet/writer/arrow/SizeStatistics.h"
 #include "velox/dwio/parquet/writer/arrow/ThriftInternal.h"
 
 namespace facebook::velox::parquet::arrow {
@@ -371,6 +372,32 @@ class ColumnChunkMetaData::ColumnChunkMetaDataImpl {
     return isStatsSet() ? possibleStats_ : nullptr;
   }
 
+  inline bool isSizeStatsSet() const {
+    return columnMetadata_->size_statistics().has_value();
+  }
+
+  std::unique_ptr<SizeStatistics> sizeStatistics() const {
+    if (!columnMetadata_->size_statistics().has_value()) {
+      return nullptr;
+    }
+    const auto& thriftSizeStats =
+        apache::thrift::can_throw(*columnMetadata_->size_statistics());
+    auto sizeStats = std::make_unique<SizeStatistics>();
+    if (thriftSizeStats.unencoded_byte_array_data_bytes().has_value()) {
+      sizeStats->unencodedByteArrayDataBytes =
+          *thriftSizeStats.unencoded_byte_array_data_bytes();
+    }
+    if (thriftSizeStats.repetition_level_histogram().has_value()) {
+      sizeStats->repetitionLevelHistogram = apache::thrift::can_throw(
+          *thriftSizeStats.repetition_level_histogram());
+    }
+    if (thriftSizeStats.definition_level_histogram().has_value()) {
+      sizeStats->definitionLevelHistogram = apache::thrift::can_throw(
+          *thriftSizeStats.definition_level_histogram());
+    }
+    return sizeStats;
+  }
+
   inline Compression::type compression() const {
     return loadEnumSafe(&*columnMetadata_->codec());
   }
@@ -543,6 +570,14 @@ std::shared_ptr<Statistics> ColumnChunkMetaData::statistics() const {
 
 bool ColumnChunkMetaData::isStatsSet() const {
   return impl_->isStatsSet();
+}
+
+bool ColumnChunkMetaData::isSizeStatsSet() const {
+  return impl_->isSizeStatsSet();
+}
+
+std::unique_ptr<SizeStatistics> ColumnChunkMetaData::sizeStatistics() const {
+  return impl_->sizeStatistics();
 }
 
 std::optional<int64_t> ColumnChunkMetaData::bloomFilterOffset() const {
@@ -1801,6 +1836,22 @@ class ColumnChunkMetaDataBuilder::ColumnChunkMetaDataBuilderImpl {
     }
   }
 
+  void setSizeStatistics(const SizeStatistics& val) {
+    facebook::velox::parquet::thrift::SizeStatistics sizeStats;
+    if (val.unencodedByteArrayDataBytes.has_value()) {
+      sizeStats.unencoded_byte_array_data_bytes() =
+          *val.unencodedByteArrayDataBytes;
+    }
+    if (!val.repetitionLevelHistogram.empty()) {
+      sizeStats.repetition_level_histogram() = val.repetitionLevelHistogram;
+    }
+    if (!val.definitionLevelHistogram.empty()) {
+      sizeStats.definition_level_histogram() = val.definitionLevelHistogram;
+    }
+    apache::thrift::can_throw(columnChunk_->meta_data())->size_statistics() =
+        std::move(sizeStats);
+  }
+
   // column chunk
   void set_file_path(const std::string& val) {
     columnChunk_->file_path() = val;
@@ -2071,6 +2122,11 @@ const ColumnDescriptor* ColumnChunkMetaDataBuilder::descr() const {
 void ColumnChunkMetaDataBuilder::setStatistics(
     const EncodedStatistics& result) {
   impl_->setStatistics(result);
+}
+
+void ColumnChunkMetaDataBuilder::setSizeStatistics(
+    const SizeStatistics& sizeStats) {
+  impl_->setSizeStatistics(sizeStats);
 }
 
 int64_t ColumnChunkMetaDataBuilder::totalCompressedSize() const {

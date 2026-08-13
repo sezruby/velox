@@ -36,6 +36,7 @@ namespace facebook::velox::parquet::arrow {
 
 class ColumnDescriptor;
 class EncodedStatistics;
+struct SizeStatistics;
 class Statistics;
 class SchemaDescriptor;
 
@@ -174,6 +175,11 @@ class PARQUET_EXPORT ColumnChunkMetaData {
   std::shared_ptr<schema::ColumnPath> pathInSchema() const;
   bool isStatsSet() const;
   std::shared_ptr<Statistics> statistics() const;
+
+  // Whether the chunk-level size statistics are present.
+  bool isSizeStatsSet() const;
+  // Chunk-level size statistics, or nullptr when not present.
+  std::unique_ptr<SizeStatistics> sizeStatistics() const;
 
   Compression::type compression() const;
   // Indicate if the ColumnChunk compression is supported by the current
@@ -489,6 +495,8 @@ class PARQUET_EXPORT ColumnChunkMetaDataBuilder {
   void setFilePath(const std::string& path);
   // Column metadata.
   void setStatistics(const EncodedStatistics& stats);
+  // Set the chunk-level size statistics.
+  void setSizeStatistics(const SizeStatistics& sizeStats);
   // Get the column descriptor.
   const ColumnDescriptor* descr() const;
 

@@ -14,9 +14,12 @@
  * limitations under the License.
  */
 
+#include <numeric>
+
 #include <arrow/io/memory.h>
 #include <arrow/type.h>
 #include <folly/init/Init.h>
+#include <gmock/gmock.h>
 #include "velox/dwio/parquet/writer/arrow/tests/TestUtil.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
@@ -31,7 +34,9 @@
 #include "velox/dwio/parquet/reader/PageReader.h"
 #include "velox/dwio/parquet/reader/ParquetTypeWithId.h"
 #include "velox/dwio/parquet/tests/ParquetTestBase.h"
+#include "velox/dwio/parquet/writer/arrow/Metadata.h"
 #include "velox/dwio/parquet/writer/arrow/PageIndex.h"
+#include "velox/dwio/parquet/writer/arrow/SizeStatistics.h"
 #include "velox/dwio/parquet/writer/arrow/tests/ColumnReader.h"
 #include "velox/dwio/parquet/writer/arrow/tests/FileReader.h"
 #include "velox/exec/Cursor.h"
@@ -248,6 +253,7 @@ TEST_F(ParquetWriterTest, createFormatOptions) {
       {"hive.parquet.writer.page-size", "2KB"},
       {"hive.parquet.writer.created-by", "test-writer"},
       {"hive.parquet.writer.enable-page-index", "true"},
+      {"hive.parquet.writer.size-statistics-level", "PAGE_AND_COLUMN_CHUNK"},
       {"iceberg.parquet.writer.page-size", "4KB"},
   });
   config::ConfigBase session({
@@ -266,11 +272,15 @@ TEST_F(ParquetWriterTest, createFormatOptions) {
   ASSERT_TRUE(parquetOptions->batchSize.has_value());
   ASSERT_TRUE(parquetOptions->createdBy.has_value());
   ASSERT_TRUE(parquetOptions->enableWritePageIndex.has_value());
+  ASSERT_TRUE(parquetOptions->sizeStatisticsLevel.has_value());
   EXPECT_FALSE(parquetOptions->enableDictionary.value());
   EXPECT_EQ(parquetOptions->dataPageSize.value(), 2 * 1024);
   EXPECT_EQ(parquetOptions->batchSize.value(), 97);
   EXPECT_EQ(parquetOptions->createdBy.value(), "test-writer");
   EXPECT_TRUE(parquetOptions->enableWritePageIndex.value());
+  EXPECT_EQ(
+      parquetOptions->sizeStatisticsLevel.value(),
+      parquetArrow::SizeStatisticsLevel::kPageAndColumnChunk);
 
   // When unset in both connector and session config, the option is left unset
   // so the writer falls back to its default (page index off).
@@ -281,6 +291,7 @@ TEST_F(ParquetWriterTest, createFormatOptions) {
             config::ConfigBase{
                 std::unordered_map<std::string, std::string>{}}));
     EXPECT_FALSE(defaultOptions->enableWritePageIndex.has_value());
+    EXPECT_FALSE(defaultOptions->sizeStatisticsLevel.has_value());
   }
 
   config::ConfigBase icebergConnectorConfig(
@@ -854,6 +865,145 @@ TEST_F(ParquetWriterTest, writePageIndexMultiplePages) {
   EXPECT_GT(offsetIndex->pageLocations().size(), 1);
   EXPECT_EQ(
       offsetIndex->pageLocations().size(), columnIndex->nullPages().size());
+}
+
+TEST_F(ParquetWriterTest, writeSizeStatistics) {
+  // Writes a nullable string column with a small data page size so the single
+  // column chunk spans multiple pages, then verifies the Parquet size
+  // statistics (PARQUET-2261) round-trip both at chunk level (ColumnMetaData)
+  // and page level (OffsetIndex and ColumnIndex).
+  constexpr int64_t kRows = 50'000;
+
+  // Every non-null value is a fixed-width string, so the expected unencoded
+  // BYTE_ARRAY byte count is exactly the byte length times the non-null count.
+  std::vector<std::string> stringStorage(kRows);
+  const auto isNullAt = [](vector_size_t row) { return row % 4 == 0; };
+  int64_t expectedNonNull{0};
+  int64_t expectedNull{0};
+  int64_t expectedUnencodedBytes{0};
+  for (int64_t i = 0; i < kRows; ++i) {
+    stringStorage[i] = fmt::format("velox-{:06d}", i);
+    if (isNullAt(i)) {
+      ++expectedNull;
+    } else {
+      ++expectedNonNull;
+      expectedUnencodedBytes += stringStorage[i].size();
+    }
+  }
+
+  const auto data = makeRowVector({
+      makeFlatVector<StringView>(
+          kRows,
+          [&](auto row) { return StringView(stringStorage[row]); },
+          isNullAt),
+  });
+
+  // Opens the Arrow page index reader over the bytes written to 'sinkPtr'. The
+  // sink is owned by the writer kept alive in 'writers_', so its buffer
+  // outlives the returned reader.
+  const auto openArrowReader = [](MemorySink* sinkPtr) {
+    std::string_view sinkData(sinkPtr->data(), sinkPtr->size());
+    auto arrowBufferReader = std::make_shared<::arrow::io::BufferReader>(
+        std::make_shared<::arrow::Buffer>(
+            reinterpret_cast<const uint8_t*>(sinkData.data()),
+            sinkData.size()));
+    return parquetArrow::ParquetFileReader::open(arrowBufferReader);
+  };
+
+  // Writes 'data' at the page-and-column-chunk level with the page index on and
+  // verifies statistics at both granularities.
+  {
+    ParquetWriterOptions writerOptions;
+    writerOptions.enableWritePageIndex = true;
+    writerOptions.sizeStatisticsLevel =
+        parquetArrow::SizeStatisticsLevel::kPageAndColumnChunk;
+    // Small data page size forces the column chunk to span many data pages.
+    writerOptions.dataPageSize = 4 * 1024;
+    auto* sinkPtr = write(data, writerOptions);
+    auto fileReader = openArrowReader(sinkPtr);
+
+    // Chunk-level statistics live in ColumnMetaData. Each metadata proxy points
+    // into its parent's thrift data, so the parents are held alive here.
+    auto metadata = fileReader->metadata();
+    auto rowGroup = metadata->rowGroup(0);
+    auto columnChunk = rowGroup->columnChunk(0);
+    ASSERT_TRUE(columnChunk->isSizeStatsSet());
+    auto chunkStats = columnChunk->sizeStatistics();
+    ASSERT_NE(chunkStats, nullptr);
+    ASSERT_TRUE(chunkStats->unencodedByteArrayDataBytes.has_value());
+    EXPECT_EQ(
+        chunkStats->unencodedByteArrayDataBytes.value(),
+        expectedUnencodedBytes);
+    // The column is optional and non-repeated, so it carries a definition level
+    // histogram [numNulls, numNonNull] and no repetition level histogram.
+    EXPECT_THAT(
+        chunkStats->definitionLevelHistogram,
+        testing::ElementsAre(expectedNull, expectedNonNull));
+    EXPECT_TRUE(chunkStats->repetitionLevelHistogram.empty());
+
+    // Page-level statistics are spread across the page index. Their per-page
+    // entries sum back to the chunk-level totals.
+    auto pageIndexReader = fileReader->getPageIndexReader();
+    ASSERT_NE(pageIndexReader, nullptr);
+    auto rowGroupIndexReader = pageIndexReader->rowGroup(0);
+    ASSERT_NE(rowGroupIndexReader, nullptr);
+    auto offsetIndex = rowGroupIndexReader->getOffsetIndex(0);
+    ASSERT_NE(offsetIndex, nullptr);
+    auto columnIndex = rowGroupIndexReader->getColumnIndex(0);
+    ASSERT_NE(columnIndex, nullptr);
+
+    const auto numPages = offsetIndex->pageLocations().size();
+    ASSERT_GT(numPages, 1);
+
+    // OffsetIndex carries one unencoded byte count per page.
+    ASSERT_TRUE(offsetIndex->hasUnencodedByteArrayDataBytes());
+    const auto& pageBytes = offsetIndex->unencodedByteArrayDataBytes();
+    ASSERT_EQ(pageBytes.size(), numPages);
+    EXPECT_EQ(
+        std::accumulate(pageBytes.begin(), pageBytes.end(), int64_t{0}),
+        expectedUnencodedBytes);
+
+    // ColumnIndex concatenates each page's definition level histogram, so the
+    // combined length is (maxDefinitionLevel + 1) per page and the per-level
+    // sums match the chunk-level histogram.
+    ASSERT_TRUE(columnIndex->hasDefinitionLevelHistograms());
+    EXPECT_FALSE(columnIndex->hasRepetitionLevelHistograms());
+    const auto& pageDefHistograms = columnIndex->definitionLevelHistograms();
+    ASSERT_EQ(pageDefHistograms.size(), 2 * numPages);
+    int64_t pageNull{0};
+    int64_t pageNonNull{0};
+    for (size_t i = 0; i < pageDefHistograms.size(); i += 2) {
+      pageNull += pageDefHistograms[i];
+      pageNonNull += pageDefHistograms[i + 1];
+    }
+    EXPECT_EQ(pageNull, expectedNull);
+    EXPECT_EQ(pageNonNull, expectedNonNull);
+  }
+
+  // Without the option, no size statistics are written at either granularity.
+  {
+    ParquetWriterOptions writerOptions;
+    writerOptions.enableWritePageIndex = true;
+    auto* sinkPtr = write(data, writerOptions);
+    auto fileReader = openArrowReader(sinkPtr);
+
+    auto metadata = fileReader->metadata();
+    auto rowGroup = metadata->rowGroup(0);
+    auto columnChunk = rowGroup->columnChunk(0);
+    EXPECT_FALSE(columnChunk->isSizeStatsSet());
+
+    auto pageIndexReader = fileReader->getPageIndexReader();
+    ASSERT_NE(pageIndexReader, nullptr);
+    auto rowGroupIndexReader = pageIndexReader->rowGroup(0);
+    ASSERT_NE(rowGroupIndexReader, nullptr);
+    auto offsetIndex = rowGroupIndexReader->getOffsetIndex(0);
+    ASSERT_NE(offsetIndex, nullptr);
+    auto columnIndex = rowGroupIndexReader->getColumnIndex(0);
+    ASSERT_NE(columnIndex, nullptr);
+    EXPECT_FALSE(offsetIndex->hasUnencodedByteArrayDataBytes());
+    EXPECT_FALSE(columnIndex->hasDefinitionLevelHistograms());
+    EXPECT_FALSE(columnIndex->hasRepetitionLevelHistograms());
+  }
 }
 
 DEBUG_ONLY_TEST_F(ParquetWriterTest, unitFromWriterOptions) {

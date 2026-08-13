@@ -131,6 +131,7 @@ void ParquetWriterOptions::merge(
       dictionaryPageSizeLimit, parquetOverrides->dictionaryPageSizeLimit);
   mergeIfSet(useParquetDataPageV2, parquetOverrides->useParquetDataPageV2);
   mergeIfSet(enableWritePageIndex, parquetOverrides->enableWritePageIndex);
+  mergeIfSet(sizeStatisticsLevel, parquetOverrides->sizeStatisticsLevel);
   mergeIfSet(dataPageSize, parquetOverrides->dataPageSize);
   mergeIfSet(batchSize, parquetOverrides->batchSize);
   mergeIfSet(createdBy, parquetOverrides->createdBy);
@@ -239,6 +240,9 @@ std::shared_ptr<WriterProperties> getArrowParquetWriterOptions(
   } else {
     properties = properties->disableWritePageIndex();
   }
+  properties = properties->sizeStatisticsLevel(
+      parquetOptions.sizeStatisticsLevel.value_or(
+          facebook::velox::parquet::arrow::DEFAULT_SIZE_STATISTICS_LEVEL));
   if (parquetOptions.createdBy.has_value()) {
     properties = properties->createdBy(parquetOptions.createdBy.value());
   }
@@ -402,6 +406,23 @@ std::optional<int64_t> toParquetBatchSize(
   } catch (const std::exception& e) {
     VELOX_USER_FAIL("Invalid parquet writer batch size: {}", e.what());
   }
+}
+
+std::optional<arrow::SizeStatisticsLevel> toSizeStatisticsLevel(
+    std::optional<std::string> level) {
+  if (!level) {
+    return std::nullopt;
+  }
+  if (level == "NONE") {
+    return arrow::SizeStatisticsLevel::kNone;
+  }
+  if (level == "COLUMN_CHUNK") {
+    return arrow::SizeStatisticsLevel::kColumnChunk;
+  }
+  if (level == "PAGE_AND_COLUMN_CHUNK") {
+    return arrow::SizeStatisticsLevel::kPageAndColumnChunk;
+  }
+  VELOX_USER_FAIL("Unsupported parquet size statistics level: {}", *level);
 }
 
 } // namespace
@@ -835,6 +856,8 @@ ParquetWriterFactory::createFormatOptions(
   parquetOptions->enableWritePageIndex = toBoolConfigValue(
       ParquetConfig::writerEnablePageIndex(connectorConfig, session),
       "enable write page index");
+  parquetOptions->sizeStatisticsLevel = toSizeStatisticsLevel(
+      ParquetConfig::writerSizeStatisticsLevel(connectorConfig, session));
   parquetOptions->dataPageSize = toParquetPageSize(
       ParquetConfig::writerPageSize(connectorConfig, session));
   parquetOptions->batchSize = toParquetBatchSize(

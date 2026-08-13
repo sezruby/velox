@@ -35,6 +35,7 @@ class ReaderProperties;
 class RowGroupMetaData;
 class RowGroupPageIndexReader;
 class SchemaDescriptor;
+struct SizeStatistics;
 
 /// \brief ColumnIndex is a proxy around
 /// facebook::velox::parquet::thrift::ColumnIndex.
@@ -86,6 +87,26 @@ class PARQUET_EXPORT ColumnIndex {
 
   /// \brief A vector of page indices for non-null pages.
   virtual const std::vector<int32_t>& nonNullPageIndices() const = 0;
+
+  /// \brief Whether per-page repetition level histograms are available.
+  virtual bool hasRepetitionLevelHistograms() const = 0;
+
+  /// \brief Concatenated repetition level histograms of all data pages.
+  ///
+  /// The values of all pages are concatenated together, so the length is
+  /// `(max_repetition_level + 1) * num_pages`. `hasRepetitionLevelHistograms`
+  /// should be called first to determine if this information is available.
+  virtual const std::vector<int64_t>& repetitionLevelHistograms() const = 0;
+
+  /// \brief Whether per-page definition level histograms are available.
+  virtual bool hasDefinitionLevelHistograms() const = 0;
+
+  /// \brief Concatenated definition level histograms of all data pages.
+  ///
+  /// The values of all pages are concatenated together, so the length is
+  /// `(max_definition_level + 1) * num_pages`. `hasDefinitionLevelHistograms`
+  /// should be called first to determine if this information is available.
+  virtual const std::vector<int64_t>& definitionLevelHistograms() const = 0;
 };
 
 /// \brief Typed implementation of ColumnIndex.
@@ -141,6 +162,16 @@ class PARQUET_EXPORT OffsetIndex {
 
   /// \brief A vector of locations for each data page in this column.
   virtual const std::vector<PageLocation>& pageLocations() const = 0;
+
+  /// \brief Whether the unencoded byte array data bytes are available.
+  virtual bool hasUnencodedByteArrayDataBytes() const = 0;
+
+  /// \brief A vector of the unencoded byte array data bytes of each data page.
+  ///
+  /// This is only meaningful for BYTE_ARRAY columns.
+  /// `hasUnencodedByteArrayDataBytes` should be called first to determine if
+  /// this information is available.
+  virtual const std::vector<int64_t>& unencodedByteArrayDataBytes() const = 0;
 };
 
 /// \brief Interface for reading the page index for a Parquet row group.
@@ -290,7 +321,12 @@ class PARQUET_EXPORT ColumnIndexBuilder {
   /// not update statistics any more.
   ///
   /// \param stats Page statistics in the encoded form.
-  virtual void addPage(const EncodedStatistics& stats) = 0;
+  /// \param sizeStats Size statistics of the page. Its level histograms, when
+  /// present, are concatenated into the column index. Pass an empty
+  /// SizeStatistics to omit size statistics.
+  virtual void addPage(
+      const EncodedStatistics& stats,
+      const SizeStatistics& sizeStats) = 0;
 
   /// \brief Complete the column index.
   ///
@@ -322,18 +358,24 @@ class PARQUET_EXPORT OffsetIndexBuilder {
 
   virtual ~OffsetIndexBuilder() = default;
 
-  /// \brief Add page location of a data page.
+  /// \brief Add page location and size statistics of a data page.
+  ///
+  /// \param unencodedByteArrayDataBytes Unencoded byte array data bytes of the
+  /// page. Only meaningful for BYTE_ARRAY columns. Pass std::nullopt to omit
+  /// it, which drops the unencoded byte array data bytes of the whole column.
   virtual void addPage(
       int64_t offset,
       int32_t compressedPageSize,
-      int64_t firstRowIndex) = 0;
+      int64_t firstRowIndex,
+      std::optional<int64_t> unencodedByteArrayDataBytes) = 0;
 
   /// \brief Add page location of a data page.
   void addPage(const PageLocation& pageLocation) {
     addPage(
         pageLocation.offset,
         pageLocation.compressedPageSize,
-        pageLocation.firstRowIndex);
+        pageLocation.firstRowIndex,
+        std::nullopt);
   }
 
   /// \brief Complete the offset index.
